@@ -193,7 +193,7 @@ async def create_jwt():
         proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
         payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
 
-        url = "https://loginbp.ggpolarbear.com/MajorLogin"
+        url = "https://loginbp.ppmainecoonghj.com/MajorLogin"
         headers = {
             "User-Agent": USERAGENT,
             "Connection": "keep-alive",
