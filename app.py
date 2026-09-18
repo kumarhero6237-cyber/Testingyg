@@ -29,7 +29,10 @@ MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
 MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 RELEASEVERSION = "OB55"
 USERAGENT = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
-SUPPORTED_REGIONS = ["IND"]
+SUPPORTED_REGIONS = [
+    "IND", "SG", "ID", "BR", "VN", "US", "SAC", "NA",
+    "RU", "TH", "TW", "BD", "PK", "ME", "CIS", "EUROPE"
+]
 
 # Server prepends a 64-byte binary header to MajorLogin responses
 MAJORLOGIN_PREFIX_LEN = 64
@@ -338,15 +341,6 @@ def get_account_info():
             data = loop.run_until_complete(
                 GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow")
             )
-
-            # India-only: do not return a non-India account even if the
-            # upstream response contains a different region.
-            basic = data.get("basicInfo") or data.get("basic_info") or {}
-            player_region = str(
-                basic.get("region", "") or basic.get("Region", "")
-            ).upper().strip()
-            if player_region not in {"IND", "INDIA", "IN"}:
-                continue
 
             uid_region_cache[uid] = region
 
