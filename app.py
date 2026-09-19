@@ -24,13 +24,16 @@ UNITY_VERSION  = "2018.4.12f1"
 X_GA_SV        = "1789534056"
 
 # External JWT provider
-JWT_PROVIDER_URL = "http://143.92.116.5:39699/Tok"
+JWT_PROVIDER_URL = "https://jwtob55.vercel.app/token"
 JWT_UID          = "4732484418"
 JWT_PASSWORD     = "BP_E7AKQ4YVHCB"
 
 # Credits
 OWNER = "@vaibhavff570"
 JOIN  = "@vaibhavapix, @vaibhavapisx"
+
+# Compatibility API key used by the previous website integration
+API_KEY = "RAM-SAGAR"
 
 REGIONS = {
     "IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID",
@@ -89,7 +92,7 @@ async def fetch_jwt_from_provider():
     Handles fields: Tok / token / jwt / access_token
     Server:         addr / serverUrl / server / server_url
     """
-    params = {"uid": JWT_UID, "pw": JWT_PASSWORD}
+    params = {"uid": JWT_UID, "password": JWT_PASSWORD}
     async with httpx.AsyncClient(timeout=15) as cl:
         r = await cl.get(JWT_PROVIDER_URL, params=params)
         r.raise_for_status()
@@ -98,23 +101,39 @@ async def fetch_jwt_from_provider():
         try:
             data = r.json()
 
+            # This provider returns both `access_token` and the game JWT in
+            # `token`. Prefer the game JWT; access_token is only a fallback.
             token = (
-                data.get("Tok")
-                or data.get("token")
+                data.get("token")
+                or data.get("Tok")
                 or data.get("jwt")
                 or data.get("access_token")
             )
+            if isinstance(token, str):
+                token = token.strip()
+            if not token and isinstance(data.get("data"), dict):
+                nested = data["data"]
+                token = (
+                    nested.get("token")
+                    or nested.get("Tok")
+                    or nested.get("jwt")
+                    or nested.get("access_token")
+                )
+                if isinstance(token, str):
+                    token = token.strip()
+                data = {**data, **nested}
+
             server = (
                 data.get("addr")
                 or data.get("serverUrl")
                 or data.get("server")
                 or data.get("server_url")
             )
-            region = (
+            region = str(
                 data.get("region")
                 or data.get("lockRegion")
                 or "IND"
-            ).upper()
+            ).upper().strip()
 
             if token:
                 return token, region, (server or "").rstrip("/") or None
@@ -204,7 +223,11 @@ async def _lookup(uid: str, unk: str, reg: str, ep: str):
 # ---------------- Routes ----------------
 
 @app.route("/Bmw")
+@app.route("/uc-info")
 def _route_bmw():
+    supplied_key = request.args.get("key") or request.headers.get("x-api-key")
+    if supplied_key != API_KEY:
+        return jsonify({"error": "Invalid or missing API key"}), 403
     uid    = (request.args.get("uid") or "").strip()
     region = (request.args.get("region") or "").strip().upper()
 
@@ -212,7 +235,7 @@ def _route_bmw():
     if not uid:
         return jsonify({
             "error": "Please provide UID",
-            "example": "/Bmw?uid=4455816879&region=IND",
+            "example": "/uc-info?uid=4455816879&key=RAM-SAGAR&region=IND",
             "credit": OWNER,
             "join": JOIN,
         }), 400
@@ -327,8 +350,8 @@ def _route_home():
         "credit": OWNER,
         "join": JOIN,
         "endpoints": {
-            "/Bmw?uid=<UID>&region=<REGION>": "Player info with explicit region",
-            "/Bmw?uid=<UID>":                 "Player info with auto region scan",
+            "/uc-info?uid=<UID>&key=RAM-SAGAR": "Player info (legacy website endpoint; optional region)",
+            "/Bmw?uid=<UID>&key=RAM-SAGAR":     "Player info with auto region scan (alias)",
             "/regions":                       "List all valid region codes",
             "/refresh":                       "Refresh JWT from provider",
             "/health":                        "Health check",
