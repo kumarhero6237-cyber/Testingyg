@@ -32,6 +32,9 @@ JWT_PASSWORD     = "Vaibhav namaste_DM9W"
 OWNER = "@vaibhavff570"
 JOIN  = "@vaibhavapix, @vaibhavapisx"
 
+# Compatibility API key used by the previous website integration
+API_KEY = "RAM-SAGAR"
+
 REGIONS = {
     "IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID",
     "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE",
@@ -204,7 +207,11 @@ async def _lookup(uid: str, unk: str, reg: str, ep: str):
 # ---------------- Routes ----------------
 
 @app.route("/Bmw")
+@app.route("/uc-info")
 def _route_bmw():
+    supplied_key = request.args.get("key") or request.headers.get("x-api-key")
+    if supplied_key != API_KEY:
+        return jsonify({"error": "Invalid or missing API key"}), 403
     uid    = (request.args.get("uid") or "").strip()
     region = (request.args.get("region") or "").strip().upper()
 
@@ -212,7 +219,7 @@ def _route_bmw():
     if not uid:
         return jsonify({
             "error": "Please provide UID",
-            "example": "/Bmw?uid=4455816879&region=IND",
+            "example": "/uc-info?uid=4455816879&key=RAM-SAGAR&region=IND",
             "credit": OWNER,
             "join": JOIN,
         }), 400
@@ -327,8 +334,8 @@ def _route_home():
         "credit": OWNER,
         "join": JOIN,
         "endpoints": {
-            "/Bmw?uid=<UID>&region=<REGION>": "Player info with explicit region",
-            "/Bmw?uid=<UID>":                 "Player info with auto region scan",
+            "/uc-info?uid=<UID>&key=RAM-SAGAR": "Player info (legacy website endpoint; optional region)",
+            "/Bmw?uid=<UID>&key=RAM-SAGAR":     "Player info with auto region scan (alias)",
             "/regions":                       "List all valid region codes",
             "/refresh":                       "Refresh JWT from provider",
             "/health":                        "Health check",
