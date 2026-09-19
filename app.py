@@ -24,9 +24,9 @@ UNITY_VERSION  = "2018.4.12f1"
 X_GA_SV        = "1789534056"
 
 # External JWT provider
-JWT_PROVIDER_URL = "http://148.113.25.200:6293/Tok"
-JWT_UID          = "7684573605"
-JWT_PASSWORD     = "Vaibhav namaste_DM9W"
+JWT_PROVIDER_URL = "https://jwtob55.vercel.app/token"
+JWT_UID          = "4732484418"
+JWT_PASSWORD     = "BP_E7AKQ4YVHCB"
 
 # Credits
 OWNER = "@vaibhavff570"
@@ -92,7 +92,7 @@ async def fetch_jwt_from_provider():
     Handles fields: Tok / token / jwt / access_token
     Server:         addr / serverUrl / server / server_url
     """
-    params = {"uid": JWT_UID, "pw": JWT_PASSWORD}
+    params = {"uid": JWT_UID, "password": JWT_PASSWORD}
     async with httpx.AsyncClient(timeout=15) as cl:
         r = await cl.get(JWT_PROVIDER_URL, params=params)
         r.raise_for_status()
@@ -101,23 +101,39 @@ async def fetch_jwt_from_provider():
         try:
             data = r.json()
 
+            # This provider returns both `access_token` and the game JWT in
+            # `token`. Prefer the game JWT; access_token is only a fallback.
             token = (
-                data.get("Tok")
-                or data.get("token")
+                data.get("token")
+                or data.get("Tok")
                 or data.get("jwt")
                 or data.get("access_token")
             )
+            if isinstance(token, str):
+                token = token.strip()
+            if not token and isinstance(data.get("data"), dict):
+                nested = data["data"]
+                token = (
+                    nested.get("token")
+                    or nested.get("Tok")
+                    or nested.get("jwt")
+                    or nested.get("access_token")
+                )
+                if isinstance(token, str):
+                    token = token.strip()
+                data = {**data, **nested}
+
             server = (
                 data.get("addr")
                 or data.get("serverUrl")
                 or data.get("server")
                 or data.get("server_url")
             )
-            region = (
+            region = str(
                 data.get("region")
                 or data.get("lockRegion")
                 or "IND"
-            ).upper()
+            ).upper().strip()
 
             if token:
                 return token, region, (server or "").rstrip("/") or None
