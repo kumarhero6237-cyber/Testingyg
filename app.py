@@ -23,7 +23,65 @@ from flask_cors import CORS
 from google.protobuf import json_format, message
 from Crypto.Cipher import AES
 
-from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
+from proto import main_pb2, AccountPersonalShow_pb2
+
+#  PART 1 — FreeFire_pb2 (inlined)
+# ============================================================
+
+_runtime_version.ValidateProtobufRuntimeVersion(
+    _runtime_version.Domain.PUBLIC, 6, 30, 0, "", "FreeFire.proto",
+)
+
+_sym_db = _symbol_database.Default()
+
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
+    b'\n\x0e\x46reeFire.proto"c\n\x08LoginReq\x12\x0f\n\x07open_id\x18\x16 \x01(\t'
+    b'\x12\x14\n\x0copen_id_type\x18\x17 \x01(\t\x12\x13\n\x0blogin_token\x18\x1d '
+    b'\x01(\t\x12\x1b\n\x13orign_platform_type\x18\x63 \x01(\t"]\n\x10\x42lacklist'
+    b'InfoRes\x12\x1e\n\nban_reason\x18\x01 \x01(\x0e\x32\n.BanReason\x12\x17\n'
+    b'\x0f\x65xpire_duration\x18\x02 \x01(\r\x12\x10\n\x08\x62\x61n_time\x18\x03 '
+    b'\x01(\r"f\n\x0eLoginQueueInfo\x12\r\n\x05\x61llow\x18\x01 \x01(\x08\x12'
+    b'\x16\n\x0equeue_position\x18\x02 \x01(\r\x12\x16\n\x0eneed_wait_secs\x18'
+    b'\x03 \x01(\r\x12\x15\n\rqueue_is_full\x18\x04 \x01(\x08"\xa0\x03\n\x08'
+    b'LoginRes\x12\x12\n\naccount_id\x18\x01 \x01(\x04\x12\x13\n\x0block_region'
+    b'\x18\x02 \x01(\t\x12\x13\n\x0bnoti_region\x18\x03 \x01(\t\x12\x11\n\tip_'
+    b'region\x18\x04 \x01(\t\x12\x19\n\x11\x61gora_environment\x18\x05 \x01(\t'
+    b'\x12\x19\n\x11new_active_region\x18\x06 \x01(\t\x12\x19\n\x11recommend_'
+    b'regions\x18\x07 \x03(\t\x12\r\n\x05token\x18\x08 \x01(\t\x12\x0b\n\x03ttl'
+    b'\x18\t \x01(\r\x12\x12\n\nserver_url\x18\n \x01(\t\x12\x16\n\x0e\x65mul'
+    b'ator_score\x18\x0b \x01(\r\x12$\n\tblacklist\x18\x0c \x01(\x0b\x32\x11.'
+    b'BlacklistInfoRes\x12#\n\nqueue_info\x18\r \x01(\x0b\x32\x0f.LoginQueue'
+    b'Info\x12\x0e\n\x06tp_url\x18\x0e \x01(\t\x12\x15\n\rapp_server_id\x18'
+    b'\x0f \x01(\r\x12\x0f\n\x07\x61no_url\x18\x10 \x01(\t\x12\x0f\n\x07ip_city'
+    b'\x18\x11 \x01(\t\x12\x16\n\x0eip_subdivision\x18\x12 \x01(\t*\xa8\x01\n'
+    b'\tBanReason\x12\x16\n\x12\x42\x41N_REASON_UNKNOWN\x10\x00\x12\x1b\n\x17'
+    b'\x42\x41N_REASON_IN_GAME_AUTO\x10\x01\x12\x15\n\x11\x42\x41N_REASON_'
+    b'REFUND\x10\x02\x12\x15\n\x11\x42\x41N_REASON_OTHERS\x10\x03\x12\x16\n'
+    b'\x12\x42\x41N_REASON_SKINMOD\x10\x04\x12 \n\x1b\x42\x41N_REASON_IN_GAME'
+    b'_AUTO_NEW\x10\xf6\x07\x62\x06proto3'
+)
+
+_globals = globals()
+_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "FreeFire_pb2", _globals)
+if not _descriptor._USE_C_DESCRIPTORS:
+    DESCRIPTOR._loaded_options = None
+    _globals["_BANREASON"]._serialized_start = 738
+    _globals["_BANREASON"]._serialized_end = 906
+    _globals["_LOGINREQ"]._serialized_start = 18
+    _globals["_LOGINREQ"]._serialized_end = 117
+    _globals["_BLACKLISTINFORES"]._serialized_start = 119
+    _globals["_BLACKLISTINFORES"]._serialized_end = 212
+    _globals["_LOGINQUEUEINFO"]._serialized_start = 214
+    _globals["_LOGINQUEUEINFO"]._serialized_end = 316
+    _globals["_LOGINRES"]._serialized_start = 319
+    _globals["_LOGINRES"]._serialized_end = 735
+
+LoginReq = _globals["LoginReq"]
+LoginRes = _globals["LoginRes"]
+
+
+# ============================================================
 
 # ---------------- Config ----------------
 
@@ -196,16 +254,16 @@ async def create_jwt():
         url = "https://loginbp.ppmainecoonghj.com/MajorLogin"
         headers = {
             "User-Agent": USERAGENT,
-            "Connection": "keep-alive",
-            "Accept-Encoding": "gzip",
-            "Content-Type": "application/octet-stream",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.12f1",
-            "X-GA": "v1 1",
+            "Accept": "*/*",
+            "Accept-Encoding": "deflate, gzip",
             "X-Ga-Sv": "1789534056",
+            "Authorization": "Bearer",
+            "X-Ga": "v1 1",
+            "Releaseversion": RELEASEVERSION,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.12f1",
             "PlAy_VeR": "1.132.1",
             "Ob_VeR": RELEASEVERSION,
-            "ReleaseVersion": RELEASEVERSION,
         }
 
         resp = await _http_client.post(url, data=payload, headers=headers)
@@ -353,9 +411,10 @@ async def create_jwt():
         game_token = _first_value(decoded, msg, "token", "gameToken", "game_token")
 
         if not server_url or not game_token:
+            safe_keys = sorted(str(k) for k in msg.keys())
             raise RuntimeError(
-                "MajorLogin parsed, but token/server fields were missing "
-                f"(region={lock_region or 'unknown'})"
+                "MajorLogin parsed but OB55 token/server fields are missing "
+                f"(region={lock_region or 'unknown'}, fields={safe_keys})"
             )
 
         # Some OB55 responses may not expose lockRegion in this protobuf.
