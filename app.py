@@ -1,372 +1,452 @@
-# Owner : @vaibhavff570
-# Join  : @vaibhavapix, @vaibhavapisx
+"""
+Free Fire India-only player information API.
+
+Important deployment note:
+- This app keeps its token/cache warm only while the Python process is alive.
+- Vercel Python functions are serverless and may be frozen/restarted, so no Python
+  background thread can guarantee "always on" there.
+- For true always-on behaviour, run this app as a persistent Gunicorn service
+  (VPS / paid always-on container / similar).
+"""
 
 import asyncio
-import time
-import httpx
+import base64
 import json
-from collections import defaultdict
-from flask import Flask, request, jsonify
+import os
+import threading
+import time
+from functools import wraps
+from typing import Tuple
+
+import httpx
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from proto import main_pb2, AccountPersonalShow_pb2
-from google.protobuf import json_format
-from google.protobuf.message import Message
+from google.protobuf import json_format, message
 from Crypto.Cipher import AES
+
+from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
 
 # ---------------- Config ----------------
 
-MAIN_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-MAIN_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+MAIN_KEY = base64.b64decode("WWcmdGMlREV1aDYlWmNeOA==")
+MAIN_IV = base64.b64decode("Nm95WkRyMjJFM3ljaGpNJQ==")
 
-RELEASEVERSION = "OB55"
-USERAGENT      = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
-UNITY_VERSION  = "2018.4.12f1"
-X_GA_SV        = "1789534056"
+RELEASEVERSION = os.getenv("FF_RELEASE_VERSION", "OB55")
+USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 
-# External JWT provider
-JWT_PROVIDER_URL = "https://jwtob55.vercel.app/token"
-JWT_UID          = "7866777204"
-JWT_PASSWORD     = "B213500853A21ACEDF07BA087089BE131686512C8FA6156208D743F9E7B1DAC2"
+# Hard India-only policy.
+INDIA_REGIONS = {"IND", "INDIA", "IN"}
 
-# Credits
-OWNER = "@vaibhavff570"
-JOIN  = "@vaibhavapix, @vaibhavapisx"
+# Keep your existing key; preferably move it to an environment variable in production.
+API_KEY = os.getenv("API_KEY", "RAM-SAGAR")
 
-# Compatibility API key used by the previous website integration
-API_KEY = "RAM-SAGAR"
+TOKEN_REFRESH_SAFETY = 300          # refresh 5 minutes before expiry
+TOKEN_FALLBACK_TTL = 25200          # 7 hours if server does not provide TTL
+REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=4.0)
 
-REGIONS = {
-    "IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID",
-    "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE",
-}
-
-# Fallback game servers (only used if provider doesn't return `addr`)
-DEFAULT_SERVERS = {
-    "IND":    "https://client.ind.freefiremobile.com",
-    "BR":     "https://client.br.freefiremobile.com",
-    "US":     "https://client.us.freefiremobile.com",
-    "SAC":    "https://client.sac.freefiremobile.com",
-    "NA":     "https://client.na.freefiremobile.com",
-    "SG":     "https://client.sg.freefiremobile.com",
-    "RU":     "https://client.ru.freefiremobile.com",
-    "ID":     "https://client.id.freefiremobile.com",
-    "TW":     "https://client.tw.freefiremobile.com",
-    "VN":     "https://client.vn.freefiremobile.com",
-    "TH":     "https://client.th.freefiremobile.com",
-    "ME":     "https://client.me.freefiremobile.com",
-    "PK":     "https://client.pk.freefiremobile.com",
-    "CIS":    "https://client.cis.freefiremobile.com",
-    "BD":     "https://client.bd.freefiremobile.com",
-    "EUROPE": "https://client.europe.freefiremobile.com",
-}
+# MajorLogin is kept configurable because Garena can move regional login hosts.
+# Current public implementations use the ggblueshark host; override with
+# MAJOR_LOGIN_URL if your live client uses a different authorized endpoint.
+MAJOR_LOGIN_URL = os.getenv(
+    "MAJOR_LOGIN_URL",
+    "https://loginbp.ggblueshark.com/MajorLogin",
+).rstrip("/")
+MAX_CONNECTIONS = 50
+MAX_KEEPALIVE = 20
 
 app = Flask(__name__)
 CORS(app)
 
-TOKENS = defaultdict(dict)
-UID_MEMORY = {}
+# ---------------- Persistent async worker ----------------
 
-# ---------------- Crypto helpers ----------------
+_loop = None
+_loop_ready = threading.Event()
+_loop_lock = threading.Lock()
+_http_client = None
+_token_lock = None
+_cached_token = None
 
-def _pad(d: bytes) -> bytes:
-    l = AES.block_size - (len(d) % AES.block_size)
-    return d + bytes([l] * l)
 
-def _enc(k: bytes, i: bytes, d: bytes) -> bytes:
-    return AES.new(k, AES.MODE_CBC, i).encrypt(_pad(d))
+def _start_async_worker():
+    global _loop
 
-def _parse(b: bytes, mt):
-    m = mt()
-    m.ParseFromString(b)
-    return m
+    with _loop_lock:
+        if _loop is not None:
+            return
+        _loop = asyncio.new_event_loop()
 
-async def _json_to_proto(jt: str, pt: Message) -> bytes:
-    json_format.ParseDict(json.loads(jt), pt)
-    return pt.SerializeToString()
+    def runner():
+        asyncio.set_event_loop(_loop)
+        _loop.run_until_complete(_async_startup())
+        _loop_ready.set()
+        _loop.run_forever()
 
-# ---------------- External JWT fetch ----------------
+    threading.Thread(target=runner, name="ff-api-async", daemon=True).start()
 
-async def fetch_jwt_from_provider():
-    """
-    Query the external JWT provider.
-    Handles fields: Tok / token / jwt / access_token
-    Server:         addr / serverUrl / server / server_url
-    """
-    params = {"uid": JWT_UID, "password": JWT_PASSWORD}
-    async with httpx.AsyncClient(timeout=15) as cl:
-        r = await cl.get(JWT_PROVIDER_URL, params=params)
-        r.raise_for_status()
-        text = r.text.strip()
+
+async def _async_startup():
+    global _http_client, _token_lock
+    _http_client = httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT,
+        limits=httpx.Limits(
+            max_connections=MAX_CONNECTIONS,
+            max_keepalive_connections=MAX_KEEPALIVE,
+            keepalive_expiry=30.0,
+        ),
+        http2=False,
+        headers={
+            "User-Agent": USERAGENT,
+            "Connection": "keep-alive",
+            "Accept-Encoding": "gzip",
+        },
+    )
+    _token_lock = asyncio.Lock()
+    # Warm token once, but do not make process startup fail if Garena is temporarily slow.
+    try:
+        await create_jwt()
+    except Exception as exc:
+        print(f"⚠️ Initial India token warm-up failed: {exc}")
+
+    asyncio.create_task(refresh_tokens_periodically())
+
+
+def _run(coro):
+    """Run a coroutine on the single persistent event loop."""
+    _start_async_worker()
+    _loop_ready.wait(timeout=10)
+    if _loop is None or not _loop.is_running():
+        raise RuntimeError("Async worker is not running")
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=15)
+
+
+# ---------------- API key ----------------
+
+def require_api_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = request.args.get("key") or request.headers.get("x-api-key")
+        if key != API_KEY:
+            return jsonify({"error": "Invalid or missing API key"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ---------------- Crypto / protobuf ----------------
+
+def pad(data: bytes) -> bytes:
+    padding_length = AES.block_size - (len(data) % AES.block_size)
+    return data + bytes([padding_length]) * padding_length
+
+
+def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext))
+
+
+def decode_protobuf(encoded_data: bytes, message_type: message.Message):
+    instance = message_type()
+    instance.ParseFromString(encoded_data)
+    return instance
+
+
+async def json_to_proto(json_data: str, proto_message: message.Message) -> bytes:
+    json_format.ParseDict(json.loads(json_data), proto_message)
+    return proto_message.SerializeToString()
+
+
+# ---------------- India guest account ----------------
+
+def get_india_account() -> str:
+    return "uid=4732484418&password=BP_E7AKQ4YVHCB"
+
+
+# ---------------- Token generation ----------------
+
+async def get_access_token(account: str):
+    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+    payload = (
+        account
+        + "&response_type=token&client_type=2"
+        + "&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+        + "&client_id=100067"
+    )
+    headers = {
+        "User-Agent": USERAGENT,
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    resp = await _http_client.post(url, data=payload, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("access_token", "0"), data.get("open_id", "0")
+
+
+async def create_jwt():
+    global _cached_token
+
+    async with _token_lock:
+        account = get_india_account()
+        token_val, open_id = await get_access_token(account)
+        if not token_val or token_val == "0" or not open_id or open_id == "0":
+            raise RuntimeError("India guest token was not returned")
+
+        body = json.dumps({
+            "open_id": open_id,
+            "open_id_type": "4",
+            "login_token": token_val,
+            "orign_platform_type": "4",
+        })
+
+        proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
+        payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
+
+        url = MAJOR_LOGIN_URL
+        headers = {
+            "User-Agent": USERAGENT,
+            "Connection": "keep-alive",
+            "Accept-Encoding": "gzip",
+            "Content-Type": "application/octet-stream",
+            "Expect": "100-continue",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": RELEASEVERSION,
+        }
+
+        resp = await _http_client.post(url, data=payload, headers=headers)
+        if resp.status_code != 200:
+            # Keep the diagnostic short; never return the full server body.
+            body_hint = resp.text[:180].replace("\n", " ").strip()
+            raise RuntimeError(
+                f"MajorLogin status {resp.status_code} at {url}"
+                + (f" | {body_hint}" if body_hint else "")
+            )
+
+        decoded = decode_protobuf(resp.content, FreeFire_pb2.LoginRes)
+        msg = json.loads(json_format.MessageToJson(decoded))
+
+        lock_region = str(msg.get("lockRegion", "")).upper()
+        if lock_region not in INDIA_REGIONS:
+            raise RuntimeError(f"India token returned unexpected region: {lock_region or 'unknown'}")
+
+        server_url = msg.get("serverUrl")
+        game_token = msg.get("token")
+        if not server_url or not game_token:
+            raise RuntimeError("MajorLogin did not return token/server")
 
         try:
-            data = r.json()
+            ttl = int(msg.get("ttl", TOKEN_FALLBACK_TTL))
+        except (TypeError, ValueError):
+            ttl = TOKEN_FALLBACK_TTL
 
-            # This provider returns both `access_token` and the game JWT in
-            # `token`. Prefer the game JWT; access_token is only a fallback.
-            token = (
-                data.get("token")
-                or data.get("Tok")
-                or data.get("jwt")
-                or data.get("access_token")
-            )
-            if isinstance(token, str):
-                token = token.strip()
-            if not token and isinstance(data.get("data"), dict):
-                nested = data["data"]
-                token = (
-                    nested.get("token")
-                    or nested.get("Tok")
-                    or nested.get("jwt")
-                    or nested.get("access_token")
-                )
-                if isinstance(token, str):
-                    token = token.strip()
-                data = {**data, **nested}
+        # Never trust an extremely long server TTL.
+        ttl = max(600, min(ttl, TOKEN_FALLBACK_TTL))
 
-            server = (
-                data.get("addr")
-                or data.get("serverUrl")
-                or data.get("server")
-                or data.get("server_url")
-            )
-            region = str(
-                data.get("region")
-                or data.get("lockRegion")
-                or "IND"
-            ).upper().strip()
+        _cached_token = {
+            "token": f"Bearer {game_token}",
+            "region": lock_region,
+            "server_url": server_url.rstrip("/"),
+            "expires_at": time.time() + ttl,
+        }
 
-            if token:
-                return token, region, (server or "").rstrip("/") or None
-
-        except Exception:
-            pass
-
-        # Fallback: plain JWT string
-        if text.startswith("eyJ"):
-            return text, "IND", None
-
-        raise RuntimeError(f"Unexpected JWT provider response: {text[:200]}")
+        print(f"✅ INDIA TOKEN READY -> {server_url} | TTL={ttl}s")
+        return True
 
 
-async def get_token(reg: str = "IND"):
-    """
-    Returns (token, region, server).
-    Cached for 7 hours.
-    """
-    info = TOKENS.get(reg)
-    if info and time.time() < info["expires"] - 60:
-        return info["token"], info["region"], info["server"]
-
-    token, lock_region, server = await fetch_jwt_from_provider()
-
-    if not server:
-        server = DEFAULT_SERVERS.get(lock_region, DEFAULT_SERVERS["IND"])
-
-    TOKENS[reg] = {
-        "token":   token if token.startswith("Bearer ") else f"Bearer {token}",
-        "region":  lock_region,
-        "server":  server.rstrip("/"),
-        "expires": time.time() + 25200,
-    }
-    print(f"✅ [{reg}] JWT ready -> {server} | region={lock_region}")
-    return TOKENS[reg]["token"], TOKENS[reg]["region"], TOKENS[reg]["server"]
-
-
-async def _refresh_all():
-    try:
-        # Only IND here since provider is India-only
-        await get_token("IND")
-    except Exception as e:
-        print(f"⚠️ JWT refresh failed: {e}")
-
-
-async def _refresh_loop():
+async def refresh_tokens_periodically():
     while True:
-        await asyncio.sleep(25200)   # 7 hours
-        await _refresh_all()
+        try:
+            await asyncio.sleep(60)
+            if not _cached_token or time.time() >= _cached_token["expires_at"] - TOKEN_REFRESH_SAFETY:
+                try:
+                    await create_jwt()
+                except Exception as exc:
+                    print(f"⚠️ India token refresh failed: {exc}")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"⚠️ Token refresh loop error: {exc}")
+            await asyncio.sleep(10)
+
+
+async def get_token_info() -> Tuple[str, str, str]:
+    if _cached_token and time.time() < _cached_token["expires_at"] - 30:
+        return (
+            _cached_token["token"],
+            _cached_token["region"],
+            _cached_token["server_url"],
+        )
+
+    await create_jwt()
+    if not _cached_token:
+        raise RuntimeError("Failed to generate India token")
+
+    return (
+        _cached_token["token"],
+        _cached_token["region"],
+        _cached_token["server_url"],
+    )
 
 
 # ---------------- Player lookup ----------------
 
-async def _lookup(uid: str, unk: str, reg: str, ep: str):
-    payload = await _json_to_proto(
+async def GetAccountInformation(uid, unk):
+    payload = await json_to_proto(
         json.dumps({"a": uid, "b": unk}),
         main_pb2.GetPlayerPersonalShow(),
     )
-    data_enc = _enc(MAIN_KEY, MAIN_IV, payload)
-    token, lock, server = await get_token(reg)
+
+    data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
+    token, lock_region, server = await get_token_info()
+
+    if lock_region.upper() not in INDIA_REGIONS:
+        raise RuntimeError("Only India region token is allowed")
 
     headers = {
         "User-Agent": USERAGENT,
         "Connection": "keep-alive",
-        "Accept-Encoding": "deflate, gzip",
+        "Accept-Encoding": "gzip",
         "Content-Type": "application/octet-stream",
         "Expect": "100-continue",
         "Authorization": token,
-        "X-Unity-Version": UNITY_VERSION,
+        "X-Unity-Version": "2018.4.11f1",
         "X-GA": "v1 1",
-        "X-Ga-Sv": X_GA_SV,
         "ReleaseVersion": RELEASEVERSION,
     }
 
-    async with httpx.AsyncClient(timeout=15) as cl:
-        res = await cl.post(server + ep, data=data_enc, headers=headers)
-        if res.status_code != 200:
-            raise RuntimeError(f"[{reg}] lookup status {res.status_code}")
-        return json.loads(
-            json_format.MessageToJson(
-                _parse(res.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
-            )
+    endpoint = server.rstrip("/") + "/GetPlayerPersonalShow"
+
+    # One fast retry after refreshing the token for expired/invalid sessions.
+    for attempt in range(2):
+        resp = await _http_client.post(endpoint, data=data_enc, headers=headers)
+
+        if resp.status_code == 401 and attempt == 0:
+            await create_jwt()
+            token, _, server = await get_token_info()
+            headers["Authorization"] = token
+            endpoint = server.rstrip("/") + "/GetPlayerPersonalShow"
+            continue
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Game server returned status {resp.status_code}")
+
+        content_type = resp.headers.get("content-type", "").lower()
+        if "application/octet-stream" not in content_type:
+            raise RuntimeError(f"Unexpected content type: {content_type}")
+
+        decoded = decode_protobuf(
+            resp.content,
+            AccountPersonalShow_pb2.AccountPersonalShowInfo,
         )
+        data = json.loads(json_format.MessageToJson(decoded))
+
+        # HARD INDIA-ONLY CHECK.
+        # The account response contains basic_info.region. If it is not India,
+        # do not return the player's data to the caller.
+        basic = data.get("basicInfo") or data.get("basic_info") or {}
+        player_region = str(basic.get("region", "")).upper().strip()
+
+        if player_region not in INDIA_REGIONS:
+            raise ValueError("UID is not an India-region Free Fire account")
+
+        # Return only the data belonging to this India account.
+        return data
+
+    raise RuntimeError("Player lookup failed")
+
+
+# Start the persistent worker as soon as this module is imported.
+_start_async_worker()
 
 
 # ---------------- Routes ----------------
 
-@app.route("/Bmw")
 @app.route("/uc-info")
-def _route_bmw():
-    supplied_key = request.args.get("key") or request.headers.get("x-api-key")
-    if supplied_key != API_KEY:
-        return jsonify({"error": "Invalid or missing API key"}), 403
-    uid    = (request.args.get("uid") or "").strip()
-    region = (request.args.get("region") or "").strip().upper()
+@require_api_key
+def get_account_info():
+    uid = request.args.get("uid", "").strip()
 
-    # --- Validate UID ---
     if not uid:
         return jsonify({
             "error": "Please provide UID",
-            "example": "/uc-info?uid=4455816879&key=RAM-SAGAR&region=IND",
-            "credit": OWNER,
-            "join": JOIN,
+            "example": "/uc-info?uid=123456789&key=RAM-SAGAR",
         }), 400
 
     if not uid.isdigit():
-        return jsonify({"error": "UID must be a valid number", "credit": OWNER}), 400
+        return jsonify({"error": "UID must be a valid number"}), 400
 
     if len(uid) > 15:
-        return jsonify({"error": "UID is too long", "credit": OWNER}), 400
+        return jsonify({"error": "UID is too long"}), 400
 
-    # --- If region provided explicitly ---
-    if region:
-        if region not in REGIONS:
-            return jsonify({
-                "error": f"Invalid region: {region}",
-                "valid_regions": sorted(REGIONS),
-                "credit": OWNER,
-            }), 400
-
-        try:
-            data = asyncio.run(_lookup(uid, "7", region, "/GetPlayerPersonalShow"))
-            UID_MEMORY[uid] = region
-            data["credit"] = OWNER
-            data["join"]   = JOIN
-            data["region"] = region
-            return json.dumps(data, indent=2, ensure_ascii=False), 200, {
-                "Content-Type": "application/json; charset=utf-8"
-            }
-        except Exception as e:
-            return jsonify({
-                "error": f"Failed to fetch UID {uid} in region {region}",
-                "details": str(e),
-                "credit": OWNER,
-            }), 404
-
-    # --- Region not provided: try cache first ---
-    if uid in UID_MEMORY:
-        try:
-            reg  = UID_MEMORY[uid]
-            data = asyncio.run(_lookup(uid, "7", reg, "/GetPlayerPersonalShow"))
-            data["credit"] = OWNER
-            data["join"]   = JOIN
-            data["region"] = reg
-            return json.dumps(data, indent=2, ensure_ascii=False), 200, {
-                "Content-Type": "application/json; charset=utf-8"
-            }
-        except Exception:
-            pass
-
-    # --- Region not provided: auto-scan all ---
-    errors = {}
-    for reg in REGIONS:
-        try:
-            data = asyncio.run(_lookup(uid, "7", reg, "/GetPlayerPersonalShow"))
-            UID_MEMORY[uid] = reg
-            data["credit"] = OWNER
-            data["join"]   = JOIN
-            data["region"] = reg
-            return json.dumps(data, indent=2, ensure_ascii=False), 200, {
-                "Content-Type": "application/json; charset=utf-8"
-            }
-        except Exception as e:
-            errors[reg] = str(e)
-            continue
-
-    return jsonify({
-        "error": "UID not found in any region",
-        "hint": "Try specifying region explicitly, e.g. /Bmw?uid=...&region=IND",
-        "credit": OWNER,
-        "details": errors,
-    }), 404
-
-
-@app.route("/regions")
-def _route_regions():
-    """List all valid region codes."""
-    return jsonify({
-        "regions": sorted(REGIONS),
-        "credit": OWNER,
-        "join": JOIN,
-    })
-
-
-@app.route("/refresh", methods=["GET", "POST"])
-def _route_refresh():
     try:
-        asyncio.run(_refresh_all())
-        return jsonify({"message": "JWT token refreshed.", "credit": OWNER}), 200
-    except Exception as e:
-        return jsonify({"error": f"Refresh failed: {e}", "credit": OWNER}), 500
+        data = _run(GetAccountInformation(uid, "7"))
+        return jsonify(data)
+    except ValueError as exc:
+        return jsonify({
+            "error": "UID is not available in the India region",
+            "message": str(exc),
+        }), 404
+    except Exception as exc:
+        print(f"❌ ERROR fetching UID {uid}: {exc}")
+        return jsonify({
+            "error": "Failed to fetch India player info",
+            "details": str(exc),
+        }), 502
+
+
+@app.route("/ref-token", methods=["GET", "POST"])
+@require_api_key
+def refresh_tokens_endpoint():
+    try:
+        _run(create_jwt())
+        return jsonify({
+            "message": "India token refreshed successfully",
+            "region": "IND",
+        }), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
 
 
 @app.route("/health")
-def _route_health():
-    ready = {
-        reg: bool(TOKENS.get(reg) and time.time() < TOKENS[reg]["expires"])
-        for reg in REGIONS
-    }
+def health():
+    token_ready = bool(
+        _cached_token and time.time() < _cached_token["expires_at"]
+    )
     return jsonify({
         "status": "ok",
-        "tokens_ready": ready,
-        "credit": OWNER,
-        "join": JOIN,
+        "region": "IND",
+        "token_ready": token_ready,
+        "always_on_note": "Requires a persistent Python process; serverless platforms may sleep.",
     })
 
 
 @app.route("/")
-def _route_home():
+def home():
     return jsonify({
-        "api": "Free Fire Info API (External JWT + Region Select)",
+        "api": "UC India Only Free Fire Info API",
         "version": RELEASEVERSION,
-        "credit": OWNER,
-        "join": JOIN,
+        "major_login_url": MAJOR_LOGIN_URL,
+        "region": "IND ONLY",
         "endpoints": {
-            "/uc-info?uid=<UID>&key=RAM-SAGAR": "Player info (legacy website endpoint; optional region)",
-            "/Bmw?uid=<UID>&key=RAM-SAGAR":     "Player info with auto region scan (alias)",
-            "/regions":                       "List all valid region codes",
-            "/refresh":                       "Refresh JWT from provider",
-            "/health":                        "Health check",
+            "/uc-info?uid=<UID>&key=RAM-SAGAR": "India player info only",
+            "/ref-token?key=RAM-SAGAR": "Refresh India auth token",
+            "/health": "Health check",
+            "/": "API info",
         },
-        "valid_regions": sorted(REGIONS),
     })
 
 
-# ---------------- Startup ----------------
+# Graceful shutdown when the hosting process stops.
+import atexit
 
-async def _startup():
-    await _refresh_all()
-    asyncio.create_task(_refresh_loop())
-
-asyncio.run(_startup())
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+@atexit.register
+def _shutdown():
+    global _loop, _http_client
+    try:
+        if _loop and _loop.is_running() and _http_client:
+            future = asyncio.run_coroutine_threadsafe(_http_client.aclose(), _loop)
+            future.result(timeout=2)
+            _loop.call_soon_threadsafe(_loop.stop)
+    except Exception:
+        pass
