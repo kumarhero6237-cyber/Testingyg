@@ -212,33 +212,98 @@ async def create_jwt():
         if resp.status_code != 200:
             raise RuntimeError(f"MajorLogin status {resp.status_code}")
 
-        # OB55-compatible response parsing: try the normal protobuf frame first,
-        # then scan likely protobuf boundaries like the working app2.py.
+        # OB55-compatible response parsing.
+        # The OB55 response can contain several protobuf/framed sections. A
+        # naive ParseFromString() may successfully parse an unrelated section
+        # (for example account_id) while silently missing token/server fields.
+        # Therefore, keep scanning candidates until we find the candidate that
+        # actually contains the game token and server URL.
         def _try_login(raw):
             try:
                 candidate = FreeFire_pb2.LoginRes()
                 candidate.ParseFromString(raw)
-                if getattr(candidate, "account_id", 0) or getattr(candidate, "accountId", 0):
-                    return candidate
+                return candidate
             except Exception:
-                pass
-            return None
+                return None
 
-        decoded = _try_login(resp.content)
-        if decoded is None:
-            raw = resp.content
-            idx = 0
-            while True:
-                idx = raw.find(b"\x08", idx)
-                if idx == -1:
-                    break
-                decoded = _try_login(raw[idx:])
-                if decoded is not None:
-                    break
-                idx += 1
+        def _flatten_values(value, prefix=""):
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    yield from _flatten_values(v, f"{prefix}.{k}" if prefix else k)
+            elif isinstance(value, list):
+                for i, v in enumerate(value):
+                    yield from _flatten_values(v, f"{prefix}[{i}]")
+            else:
+                yield prefix, value
 
-        if decoded is None:
-            raise RuntimeError(f"Could not parse MajorLogin response: {resp.content[:200]!r}")
+        def _candidate_score(candidate):
+            try:
+                obj = json.loads(
+                    json_format.MessageToJson(
+                        candidate,
+                        preserving_proto_field_name=True,
+                    )
+                )
+            except Exception:
+                return 0
+
+            score = 0
+            for key, value in _flatten_values(obj):
+                k = key.lower()
+                s = str(value or "")
+                if not s:
+                    continue
+                if k.endswith("token") or k.endswith(".gametoken") or k == "token":
+                    score += 10
+                if "serverurl" in k or k.endswith(".server_url"):
+                    score += 10
+                if s.startswith("eyj") and s.count(".") >= 2:
+                    score += 12
+                if s.startswith("http://") or s.startswith("https://"):
+                    score += 6
+                if "lockregion" in k or k.endswith(".region"):
+                    score += 2
+            return score
+
+        raw = resp.content
+        candidates = []
+
+        # Whole response.
+        candidate = _try_login(raw)
+        if candidate is not None:
+            candidates.append(candidate)
+
+        # Try protobuf boundaries. Do NOT stop at the first parseable message:
+        # protobuf parsing is permissive and an unrelated embedded section can
+        # parse successfully.
+        idx = 0
+        seen_offsets = set()
+        while True:
+            idx = raw.find(b"\x08", idx)
+            if idx == -1:
+                break
+            if idx not in seen_offsets:
+                seen_offsets.add(idx)
+                candidate = _try_login(raw[idx:])
+                if candidate is not None:
+                    candidates.append(candidate)
+            idx += 1
+
+        decoded = None
+        best_score = -1
+        for candidate in candidates:
+            score = _candidate_score(candidate)
+            if score > best_score:
+                best_score = score
+                decoded = candidate
+
+        if decoded is None or best_score <= 0:
+            # Last-resort diagnostic only: report safe structural information,
+            # never credentials or bearer tokens.
+            raise RuntimeError(
+                f"Could not locate OB55 LoginRes token/server in MajorLogin response "
+                f"(bytes={len(raw)}, candidates={len(candidates)})"
+            )
 
         # Protobuf field naming can differ between generated OB55 schemas.
         # Read both JSON names and direct protobuf attributes.
@@ -250,16 +315,27 @@ async def create_jwt():
         )
 
         def _first_value(message, mapping, *names):
+            wanted = {n.lower().replace("-", "_") for n in names}
+
+            # Direct top-level lookup first.
             for name in names:
-                value = mapping.get(name)
-                if value not in (None, "", 0):
-                    return value
-                try:
-                    value = getattr(message, name)
+                for candidate_name in (name, name.replace("_", "")):
+                    value = mapping.get(candidate_name)
                     if value not in (None, "", 0):
                         return value
-                except Exception:
-                    pass
+                    try:
+                        value = getattr(message, candidate_name)
+                        if value not in (None, "", 0):
+                            return value
+                    except Exception:
+                        pass
+
+            # Then search nested protobuf objects/dicts.
+            for key, value in _flatten_values(mapping):
+                normalized = key.split(".")[-1].replace("_", "").lower()
+                if normalized in {n.replace("_", "") for n in wanted}:
+                    if value not in (None, "", 0):
+                        return value
             return ""
 
         lock_region = str(
