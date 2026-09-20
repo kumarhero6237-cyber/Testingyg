@@ -240,14 +240,59 @@ async def create_jwt():
         if decoded is None:
             raise RuntimeError(f"Could not parse MajorLogin response: {resp.content[:200]!r}")
 
-        msg = json.loads(json_format.MessageToJson(decoded))
+        # Protobuf field naming can differ between generated OB55 schemas.
+        # Read both JSON names and direct protobuf attributes.
+        msg = json.loads(
+            json_format.MessageToJson(
+                decoded,
+                preserving_proto_field_name=True,
+            )
+        )
 
-        lock_region = str(msg.get("lockRegion", "")).upper()
+        def _first_value(message, mapping, *names):
+            for name in names:
+                value = mapping.get(name)
+                if value not in (None, "", 0):
+                    return value
+                try:
+                    value = getattr(message, name)
+                    if value not in (None, "", 0):
+                        return value
+                except Exception:
+                    pass
+            return ""
+
+        lock_region = str(
+            _first_value(
+                decoded,
+                msg,
+                "lockRegion",
+                "lock_region",
+                "region",
+                "lockregion",
+            )
+        ).upper().strip()
+
+        server_url = _first_value(decoded, msg, "serverUrl", "server_url")
+        game_token = _first_value(decoded, msg, "token", "gameToken", "game_token")
+
+        if not server_url or not game_token:
+            raise RuntimeError(
+                "MajorLogin parsed, but token/server fields were missing "
+                f"(region={lock_region or 'unknown'})"
+            )
+
+        # Some OB55 responses may not expose lockRegion in this protobuf.
+        # In that case, rely on the returned game server host only if it
+        # clearly identifies an India server; otherwise reject safely.
         if lock_region not in INDIA_REGIONS:
-            raise RuntimeError(f"India token returned unexpected region: {lock_region or 'unknown'}")
-
-        server_url = msg.get("serverUrl")
-        game_token = msg.get("token")
+            server_host = str(server_url).lower()
+            india_host_markers = (".ind.", "ind.", "india", "in-gp", "ind-gp")
+            if not any(marker in server_host for marker in india_host_markers):
+                raise RuntimeError(
+                    f"India token returned unexpected region: {lock_region or 'unknown'}"
+                )
+            lock_region = "IND"
         if not server_url or not game_token:
             raise RuntimeError("MajorLogin did not return token/server")
 
@@ -326,8 +371,11 @@ async def GetAccountInformation(uid, unk):
         "Content-Type": "application/octet-stream",
         "Expect": "100-continue",
         "Authorization": token,
-        "X-Unity-Version": "2018.4.11f1",
+        "X-Unity-Version": "2018.4.12f1",
         "X-GA": "v1 1",
+        "X-Ga-Sv": "1789534056",
+        "PlAy_VeR": "1.132.1",
+        "Ob_VeR": RELEASEVERSION,
         "ReleaseVersion": RELEASEVERSION,
     }
 
