@@ -203,6 +203,8 @@ async def create_jwt():
             "X-Unity-Version": "2018.4.12f1",
             "X-GA": "v1 1",
             "X-Ga-Sv": "1789534056",
+            "PlAy_VeR": "1.132.1",
+            "Ob_VeR": RELEASEVERSION,
             "ReleaseVersion": RELEASEVERSION,
         }
 
@@ -227,7 +229,7 @@ async def create_jwt():
             raw = resp.content
             idx = 0
             while True:
-                idx = raw.find(b"\\x08", idx)
+                idx = raw.find(b"\x08", idx)
                 if idx == -1:
                     break
                 decoded = _try_login(raw[idx:])
