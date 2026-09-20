@@ -154,7 +154,7 @@ async def json_to_proto(json_data: str, proto_message: message.Message) -> bytes
 # ---------------- India guest account ----------------
 
 def get_india_account() -> str:
-    return "uid=7866777204&password=B213500853A21ACEDF07BA087089BE131686512C8FA6156208D743F9E7B1DAC2"
+    return "uid=7866777948&password=88C8472BE7B18541B595ECF6E0052ADA6104998929A36DCB7A3AF950E4E3732A"
 
 
 # ---------------- Token generation ----------------
